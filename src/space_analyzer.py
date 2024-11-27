@@ -15,49 +15,74 @@ class SpaceAnalyzer:
     @staticmethod
     def get_stream_sizes(video_path: Path) -> List[StreamSize]:
         """Analyze video file to get the size of each stream."""
+        video_path = Path(video_path).resolve()
+        
         cmd = [
             'ffprobe',
-            '-v', 'quiet',
+            '-v', 'error',
             '-print_format', 'json',
             '-show_streams',
             '-show_format',
             str(video_path)
         ]
         
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"Failed to get stream info: {result.stderr}")
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True
+            )
             
-        data = json.loads(result.stdout)
-        duration = float(data.get('format', {}).get('duration', 0))
-        if duration == 0:
-            return []
+            data = json.loads(result.stdout)
             
-        stream_sizes = []
-        for stream in data.get('streams', []):
-            if stream['codec_type'] not in ('audio', 'subtitle'):
-                continue
+            if not data.get('format'):
+                raise RuntimeError("No format information found in the video file")
                 
-            bit_rate = stream.get('bit_rate')
-            if not bit_rate:
-                tags = stream.get('tags', {})
-                bit_rate = tags.get('BPS') or tags.get('bit_rate')
+            duration = float(data.get('format', {}).get('duration', 0))
+            if duration == 0:
+                raise RuntimeError("Could not determine video duration")
+                
+            stream_sizes = []
+            for stream in data.get('streams', []):
+                if stream['codec_type'] not in ('audio', 'subtitle'):
+                    continue
+                    
+                # Try multiple ways to get bitrate information
+                bit_rate = None
+                if 'bit_rate' in stream:
+                    bit_rate = stream['bit_rate']
+                elif 'tags' in stream:
+                    tags = stream['tags']
+                    bit_rate = tags.get('BPS') or tags.get('bit_rate')
+                    
+                if bit_rate:
+                    try:
+                        size_bytes = int(float(bit_rate) * duration / 8)
+                        stream_sizes.append(StreamSize(
+                            type=stream['codec_type'],
+                            language=stream.get('tags', {}).get('language', 'und'),
+                            size_bytes=size_bytes
+                        ))
+                    except (ValueError, TypeError):
+                        logger.warning(f"Could not calculate size for {stream['codec_type']} stream")
+                        
+            return stream_sizes
             
-            if bit_rate:
-                size_bytes = int(float(bit_rate) * duration / 8)
-                stream_sizes.append(StreamSize(
-                    type=stream['codec_type'],
-                    language=stream.get('tags', {}).get('language', 'und'),
-                    size_bytes=size_bytes
-                ))
-        
-        return stream_sizes
+        except subprocess.CalledProcessError as e:
+            error_output = e.stderr.strip() if e.stderr else "No error output available"
+            raise RuntimeError(f"Failed to analyze video streams: {error_output}")
+        except json.JSONDecodeError:
+            raise RuntimeError("Failed to parse ffprobe output")
+        except Exception as e:
+            raise RuntimeError(f"Unexpected error analyzing streams: {str(e)}")
 
-    def analyze_savings(self, video_path: Path, process_audio: bool = True,
-                       process_subtitles: bool = True, remove_audio_languages: List[str] = None,
-                       keep_audio_languages: List[str] = None, remove_subtitle_languages: List[str] = None,
-                       keep_subtitle_languages: List[str] = None) -> Dict:
+    def analyze_savings(self, video_path: Path, **kwargs) -> dict:
         """Analyze potential space savings from removing tracks."""
+        video_path = Path(video_path).resolve()
+        if not video_path.exists():
+            raise RuntimeError(f"File not found: {video_path}")
+            
         stream_sizes = self.get_stream_sizes(video_path)
         total_savings = 0
         savings_breakdown = {
@@ -66,13 +91,13 @@ class SpaceAnalyzer:
         }
         
         for stream in stream_sizes:
-            if not process_audio and stream.type == 'audio':
+            if not kwargs.get('process_audio') and stream.type == 'audio':
                 continue
-            if not process_subtitles and stream.type == 'subtitle':
+            if not kwargs.get('process_subtitles') and stream.type == 'subtitle':
                 continue
             
-            remove_langs = remove_audio_languages if stream.type == 'audio' else remove_subtitle_languages
-            keep_langs = keep_audio_languages if stream.type == 'audio' else keep_subtitle_languages
+            remove_langs = kwargs.get('remove_audio_languages') if stream.type == 'audio' else kwargs.get('remove_subtitle_languages')
+            keep_langs = kwargs.get('keep_audio_languages') if stream.type == 'audio' else kwargs.get('keep_subtitle_languages')
             
             should_remove = False
             if remove_langs and stream.language in remove_langs:
